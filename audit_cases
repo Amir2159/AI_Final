@@ -1,0 +1,676 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# Configuration
+# ============================================================
+ROOT = Path(r"D:\Projects\Simulations\AI FInal\Ansys\Shapes")
+REPORT = ROOT / "_audit_report.csv"
+
+RE_RE_FOLDER = re.compile(r"Re(\d+)", re.IGNORECASE)
+
+# Required nd outputs for loading / training pipeline
+REQUIRED_FILE_KEYS = [
+    "field_core_nd.csv",
+    "bc_inlet_nd.csv",
+    "bc_outlet_nd.csv",
+    "bc_wall_nd.csv",
+    "bc_body_nd.csv",
+]
+
+# Optional nd outputs that may exist
+OPTIONAL_FILE_KEYS = [
+    "field_extra_nd.csv",
+    "cd_history_clean.csv",
+    "cl_history_clean.csv",
+    "deltap_history_clean.csv",
+    "La_clean.csv",
+    "La_value_clean.csv",
+    "La_history_clean.csv",
+    "final_values_summary.csv",
+    "final_values_summary.json",
+    "case_summary.json",
+]
+
+# Only actual legacy pressure files should fail
+FORBIDDEN_LEGACY_FILE_PATTERNS = [
+    re.compile(r"(^|[._-])p_front([._-]|$)", re.IGNORECASE),
+    re.compile(r"(^|[._-])p_rear([._-]|$)", re.IGNORECASE),
+    re.compile(r"(^|[._-])front_pressure([._-]|$)", re.IGNORECASE),
+    re.compile(r"(^|[._-])rear_pressure([._-]|$)", re.IGNORECASE),
+]
+
+# Base columns required for PDE sampling from field_core
+REQ_FIELD_CORE_BASE_COLS = {"x_nd", "y_nd", "phi_nd", "shape", "Re"}
+
+# Labels are optional: if present => supervised data exists
+FIELD_LABEL_COLS = {"u_nd", "v_nd", "p_nd"}
+
+# Required columns for all boundary files
+REQ_BC_COLS = {"x_nd", "y_nd", "phi_nd", "shape", "Re"}
+
+# Required top-level case_summary sections
+REQ_CASE_SUMMARY_TOP_KEYS = ["scales", "files", "final_values", "notes"]
+
+# Required scales
+REQ_SCALES_KEYS = ["D_m", "Uref_mps", "rho_kgm3", "p_scale_rhoU2"]
+
+# Final values we actually care about
+FINAL_VALUE_KEYS = {
+    "Cd": ["Cd_final_used", "Cd_mean", "Cd_last", "Cd"],
+    "Cl": ["Cl_final_used", "Cl_mean", "Cl_last", "Cl"],
+    "deltap": [
+        "deltap_nd_final_used",
+        "deltap_Pa_final_used",
+        "deltap_nd_mean",
+        "deltap_Pa_mean",
+        "deltap_nd",
+        "deltap_Pa",
+        "deltap",
+    ],
+    "La": [
+        "La_nd_final_used",
+        "La_m_final_used",
+        "La_nd",
+        "La_m",
+        "La",
+    ],
+}
+
+
+@dataclass
+class CaseAudit:
+    nd_dir: str
+    case_id: str
+    shape: str
+    Re: int
+    status: str
+    reasons: str
+
+    has_scales: int
+    has_reference_points: int
+    has_final_values_section: int
+    has_notes: int
+    has_geometry_info: int
+    has_legacy_files_or_keys: int
+
+    rows_field_core: int
+    rows_bc_inlet: int
+    rows_bc_outlet: int
+    rows_bc_wall: int
+    rows_bc_body: int
+
+    has_field_u: int
+    has_field_v: int
+    has_field_p: int
+    has_field_uvp: int
+
+    has_cd_target: int
+    has_cl_target: int
+    has_deltap_target: int
+    has_La_target: int
+
+    phi_field_neg_pct: float
+    phi_body_abs_mean: float
+    phi_body_abs_max: float
+
+    data_used: str
+
+
+def discover_nd_dirs(root: Path) -> List[Path]:
+    return sorted({p.parent for p in root.rglob("nd/case_summary.json")})
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _folder_Re(nd_dir: Path) -> Optional[int]:
+    for parent in nd_dir.parents:
+        m = RE_RE_FOLDER.fullmatch(parent.name)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _folder_shape(nd_dir: Path) -> Optional[str]:
+    try:
+        return nd_dir.parent.parent.name
+    except Exception:
+        return None
+
+
+def _resolve_file(files: Dict[str, str], nd_dir: Path, key: str) -> Path:
+    raw = files.get(key, None)
+    if raw is None:
+        return nd_dir / key
+
+    p = Path(str(raw))
+    candidates: List[Path] = []
+
+    if p.is_absolute():
+        candidates.append(p)
+        candidates.append(nd_dir / p.name)
+    else:
+        candidates.append(nd_dir / p)
+        candidates.append(nd_dir / p.name)
+        candidates.append(p)
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    return candidates[0] if candidates else (nd_dir / key)
+
+
+def _read_cols(csv_path: Path, nrows: int = 5) -> List[str]:
+    df = pd.read_csv(csv_path, nrows=nrows)
+    return list(df.columns)
+
+
+def _read_rows_count(csv_path: Path) -> int:
+    with open(csv_path, "rb") as f:
+        return max(0, sum(1 for _ in f) - 1)
+
+
+def _is_finite_number(x: Any) -> bool:
+    try:
+        if x is None:
+            return False
+        if isinstance(x, str) and x.strip() == "":
+            return False
+        return bool(np.isfinite(float(x)))
+    except Exception:
+        return False
+
+
+def _has_numeric_value(d: Dict[str, Any], keys: List[str]) -> int:
+    for k in keys:
+        if k in d and _is_finite_number(d[k]):
+            return 1
+    return 0
+
+
+def _compose_data_used(
+    has_field_uvp: int,
+    rows_field_core: int,
+    rows_bc_inlet: int,
+    rows_bc_outlet: int,
+    rows_bc_wall: int,
+    rows_bc_body: int,
+    has_cd_target: int,
+    has_cl_target: int,
+    has_deltap_target: int,
+    has_La_target: int,
+) -> str:
+    parts: List[str] = []
+
+    if rows_field_core > 0:
+        parts.append("pde_field")
+    if has_field_uvp:
+        parts.append("supervised_uvp")
+
+    bc_parts = []
+    if rows_bc_inlet > 0:
+        bc_parts.append("inlet")
+    if rows_bc_outlet > 0:
+        bc_parts.append("outlet")
+    if rows_bc_wall > 0:
+        bc_parts.append("wall")
+    if rows_bc_body > 0:
+        bc_parts.append("body")
+    if bc_parts:
+        parts.append("bc:" + ",".join(bc_parts))
+
+    target_parts = []
+    if has_cd_target:
+        target_parts.append("Cd")
+    if has_cl_target:
+        target_parts.append("Cl")
+    if has_deltap_target:
+        target_parts.append("DeltaP")
+    if has_La_target:
+        target_parts.append("La")
+    if target_parts:
+        parts.append("targets:" + ",".join(target_parts))
+
+    return " | ".join(parts) if parts else "none"
+
+
+def _legacy_name_match(name: str) -> bool:
+    return any(p.search(name) for p in FORBIDDEN_LEGACY_FILE_PATTERNS)
+
+
+def _scan_forbidden_file_names(nd_dir: Path, files: Dict[str, Any]) -> List[str]:
+    found: List[str] = []
+
+    # Check file section entries as filenames/paths only
+    for key, raw in files.items():
+        key_s = str(key)
+        raw_s = str(raw)
+        raw_name = Path(raw_s).name
+
+        if _legacy_name_match(key_s):
+            found.append(f"files_key:{key_s}")
+        if _legacy_name_match(raw_s):
+            found.append(f"files_value:{raw_s}")
+        if _legacy_name_match(raw_name):
+            found.append(f"files_value_name:{raw_name}")
+
+    # Check actual files physically present in nd_dir
+    if nd_dir.exists():
+        for p in nd_dir.iterdir():
+            if p.is_file() and _legacy_name_match(p.name):
+                found.append(f"nd_dir_file:{p.name}")
+
+    return sorted(set(found))
+
+
+def _validate_top_sections(meta: Dict[str, Any], reasons: List[str]):
+    has_scales = int(isinstance(meta.get("scales"), dict))
+    has_reference_points = int(isinstance(meta.get("reference_points"), dict))  # optional info only
+    has_final_values_section = int(isinstance(meta.get("final_values"), dict))
+    has_notes = int(isinstance(meta.get("notes"), dict))
+    has_geometry_info = int(("body_info" in meta) or ("polygon_vertices_m" in meta))
+
+    for k in REQ_CASE_SUMMARY_TOP_KEYS:
+        if k not in meta:
+            reasons.append(f"missing_case_summary_key:{k}")
+
+    if not has_geometry_info:
+        reasons.append("missing_geometry_info:need_body_info_or_polygon_vertices_m")
+
+    return has_scales, has_reference_points, has_final_values_section, has_notes, has_geometry_info
+
+
+def _validate_scales(scales: Dict[str, Any], reasons: List[str]) -> None:
+    if not isinstance(scales, dict):
+        reasons.append("bad_type:scales")
+        return
+
+    for k in REQ_SCALES_KEYS:
+        if k not in scales:
+            reasons.append(f"missing_scales_key:{k}")
+        elif not _is_finite_number(scales[k]):
+            reasons.append(f"bad_scales_value:{k}")
+
+    for k in ["D_m", "Uref_mps", "rho_kgm3", "p_scale_rhoU2"]:
+        if k in scales and _is_finite_number(scales[k]):
+            if float(scales[k]) <= 0:
+                reasons.append(f"bad_scales_value:{k}<=0")
+
+
+def _validate_files_section(files: Dict[str, Any], nd_dir: Path, reasons: List[str]) -> Dict[str, Path]:
+    if not isinstance(files, dict):
+        reasons.append("bad_type:files")
+        return {}
+
+    required_paths: Dict[str, Path] = {}
+
+    for key in REQUIRED_FILE_KEYS:
+        if key not in files:
+            reasons.append(f"missing_files_key:{key}")
+
+        p = _resolve_file(files, nd_dir, key)
+        required_paths[key] = p
+        if not p.exists():
+            reasons.append(f"missing_file:{key}=>{p}")
+
+    for key in OPTIONAL_FILE_KEYS:
+        if key in files:
+            p = _resolve_file(files, nd_dir, key)
+            if not p.exists():
+                reasons.append(f"missing_optional_file:{key}=>{p}")
+
+    forbidden_hits = _scan_forbidden_file_names(nd_dir, files)
+    for hit in forbidden_hits:
+        reasons.append(f"forbidden_legacy_file_or_key:{hit}")
+
+    return required_paths
+
+
+def _validate_final_values(final_vals: Dict[str, Any], reasons: List[str]):
+    if not isinstance(final_vals, dict):
+        reasons.append("bad_type:final_values")
+        return 0, 0, 0, 0
+
+    has_cd_target = _has_numeric_value(final_vals, FINAL_VALUE_KEYS["Cd"])
+    has_cl_target = _has_numeric_value(final_vals, FINAL_VALUE_KEYS["Cl"])
+    has_deltap_target = _has_numeric_value(final_vals, FINAL_VALUE_KEYS["deltap"])
+    has_La_target = _has_numeric_value(final_vals, FINAL_VALUE_KEYS["La"])
+
+    if not has_cd_target:
+        reasons.append("missing_final_value:Cd")
+    if not has_cl_target:
+        reasons.append("missing_final_value:Cl")
+    if not has_deltap_target:
+        reasons.append("missing_final_value:deltap")
+    if not has_La_target:
+        reasons.append("missing_final_value:La")
+
+    return has_cd_target, has_cl_target, has_deltap_target, has_La_target
+
+
+def audit_one_case(
+    nd_dir: Path,
+    tol_phi_body_abs_mean: float = 1e-3,
+    max_phi_field_neg_pct: float = 0.1,
+) -> CaseAudit:
+    reasons: List[str] = []
+
+    cs_path = nd_dir / "case_summary.json"
+    if not cs_path.exists():
+        return CaseAudit(
+            nd_dir=str(nd_dir),
+            case_id="",
+            shape="",
+            Re=-1,
+            status="FAIL",
+            reasons="missing_file:case_summary.json",
+            has_scales=0,
+            has_reference_points=0,
+            has_final_values_section=0,
+            has_notes=0,
+            has_geometry_info=0,
+            has_legacy_files_or_keys=0,
+            rows_field_core=0,
+            rows_bc_inlet=0,
+            rows_bc_outlet=0,
+            rows_bc_wall=0,
+            rows_bc_body=0,
+            has_field_u=0,
+            has_field_v=0,
+            has_field_p=0,
+            has_field_uvp=0,
+            has_cd_target=0,
+            has_cl_target=0,
+            has_deltap_target=0,
+            has_La_target=0,
+            phi_field_neg_pct=float("nan"),
+            phi_body_abs_mean=float("nan"),
+            phi_body_abs_max=float("nan"),
+            data_used="none",
+        )
+
+    try:
+        meta = _read_json(cs_path)
+    except Exception as e:
+        return CaseAudit(
+            nd_dir=str(nd_dir),
+            case_id="",
+            shape="",
+            Re=-1,
+            status="FAIL",
+            reasons=f"bad_json:case_summary.json:{type(e).__name__}",
+            has_scales=0,
+            has_reference_points=0,
+            has_final_values_section=0,
+            has_notes=0,
+            has_geometry_info=0,
+            has_legacy_files_or_keys=0,
+            rows_field_core=0,
+            rows_bc_inlet=0,
+            rows_bc_outlet=0,
+            rows_bc_wall=0,
+            rows_bc_body=0,
+            has_field_u=0,
+            has_field_v=0,
+            has_field_p=0,
+            has_field_uvp=0,
+            has_cd_target=0,
+            has_cl_target=0,
+            has_deltap_target=0,
+            has_La_target=0,
+            phi_field_neg_pct=float("nan"),
+            phi_body_abs_mean=float("nan"),
+            phi_body_abs_max=float("nan"),
+            data_used="none",
+        )
+
+    files = meta.get("files", {})
+    scales = meta.get("scales", {})
+    final_vals = meta.get("final_values", {})
+
+    fshape = _folder_shape(nd_dir)
+    fRe = _folder_Re(nd_dir)
+
+    case_id = str(meta.get("case_id", nd_dir.parent.name))
+    shape = str(meta.get("shape", fshape if fshape is not None else ""))
+    try:
+        Re = int(float(meta.get("Re", fRe if fRe is not None else -1)))
+    except Exception:
+        Re = fRe if fRe is not None else -1
+
+    if fshape and shape and fshape.lower() != shape.lower():
+        reasons.append(f"shape_mismatch:folder={fshape},summary={shape}")
+    if fRe is not None and Re != -1 and fRe != Re:
+        reasons.append(f"Re_mismatch:folder={fRe},summary={Re}")
+
+    has_scales, has_reference_points, has_final_values_section, has_notes, has_geometry_info = _validate_top_sections(meta, reasons)
+    _validate_scales(scales, reasons)
+    required_paths = _validate_files_section(files, nd_dir, reasons)
+    has_cd_target, has_cl_target, has_deltap_target, has_La_target = _validate_final_values(final_vals, reasons)
+
+    has_legacy_files_or_keys = int(any("forbidden_legacy_file_or_key:" in r for r in reasons))
+
+    p_field = required_paths.get("field_core_nd.csv", nd_dir / "field_core_nd.csv")
+    p_inlet = required_paths.get("bc_inlet_nd.csv", nd_dir / "bc_inlet_nd.csv")
+    p_outlet = required_paths.get("bc_outlet_nd.csv", nd_dir / "bc_outlet_nd.csv")
+    p_wall = required_paths.get("bc_wall_nd.csv", nd_dir / "bc_wall_nd.csv")
+    p_body = required_paths.get("bc_body_nd.csv", nd_dir / "bc_body_nd.csv")
+
+    if not all([p_field.exists(), p_inlet.exists(), p_outlet.exists(), p_wall.exists(), p_body.exists()]):
+        return CaseAudit(
+            nd_dir=str(nd_dir),
+            case_id=case_id,
+            shape=shape,
+            Re=Re,
+            status="FAIL",
+            reasons=";".join(reasons) if reasons else "missing_required_nd_files",
+            has_scales=has_scales,
+            has_reference_points=has_reference_points,
+            has_final_values_section=has_final_values_section,
+            has_notes=has_notes,
+            has_geometry_info=has_geometry_info,
+            has_legacy_files_or_keys=has_legacy_files_or_keys,
+            rows_field_core=0,
+            rows_bc_inlet=0,
+            rows_bc_outlet=0,
+            rows_bc_wall=0,
+            rows_bc_body=0,
+            has_field_u=0,
+            has_field_v=0,
+            has_field_p=0,
+            has_field_uvp=0,
+            has_cd_target=has_cd_target,
+            has_cl_target=has_cl_target,
+            has_deltap_target=has_deltap_target,
+            has_La_target=has_La_target,
+            phi_field_neg_pct=float("nan"),
+            phi_body_abs_mean=float("nan"),
+            phi_body_abs_max=float("nan"),
+            data_used="none",
+        )
+
+    field_cols = set(_read_cols(p_field))
+    if not REQ_FIELD_CORE_BASE_COLS.issubset(field_cols):
+        missing = sorted(list(REQ_FIELD_CORE_BASE_COLS - field_cols))
+        reasons.append(f"field_core_missing_base_cols:{missing}")
+
+    has_field_u = int("u_nd" in field_cols)
+    has_field_v = int("v_nd" in field_cols)
+    has_field_p = int("p_nd" in field_cols)
+    has_field_uvp = int(all(c in field_cols for c in FIELD_LABEL_COLS))
+
+    for p, tag in [(p_inlet, "inlet"), (p_outlet, "outlet"), (p_wall, "wall"), (p_body, "body")]:
+        cols = set(_read_cols(p))
+        if not REQ_BC_COLS.issubset(cols):
+            missing = sorted(list(REQ_BC_COLS - cols))
+            reasons.append(f"bc_{tag}_missing_cols:{missing}")
+
+    rows_field = _read_rows_count(p_field)
+    rows_inlet = _read_rows_count(p_inlet)
+    rows_outlet = _read_rows_count(p_outlet)
+    rows_wall = _read_rows_count(p_wall)
+    rows_body = _read_rows_count(p_body)
+
+    if rows_field <= 0:
+        reasons.append("empty_csv:field_core_nd.csv")
+    if rows_inlet <= 0:
+        reasons.append("empty_csv:bc_inlet_nd.csv")
+    if rows_outlet <= 0:
+        reasons.append("empty_csv:bc_outlet_nd.csv")
+    if rows_wall <= 0:
+        reasons.append("empty_csv:bc_wall_nd.csv")
+    if rows_body <= 0:
+        reasons.append("empty_csv:bc_body_nd.csv")
+
+    try:
+        df_chk = pd.read_csv(p_field, usecols=["shape", "Re"], nrows=2000)
+        if len(df_chk) > 0:
+            if df_chk["shape"].nunique() != 1 or str(df_chk["shape"].iloc[0]).lower() != str(shape).lower():
+                reasons.append("shape_value_mismatch_in_field_core")
+            if df_chk["Re"].nunique() != 1 or int(float(df_chk["Re"].iloc[0])) != int(Re):
+                reasons.append("Re_value_mismatch_in_field_core")
+    except Exception as e:
+        reasons.append(f"field_core_value_check_fail:{type(e).__name__}")
+
+    try:
+        phi_field = pd.read_csv(p_field, usecols=["phi_nd"])["phi_nd"]
+        phi_field = pd.to_numeric(phi_field, errors="coerce")
+        phi_field_neg_pct = float((phi_field < 0).mean() * 100.0)
+        if phi_field_neg_pct > max_phi_field_neg_pct:
+            reasons.append(f"sanity_fail:phi_field_neg_pct={phi_field_neg_pct:.3f}%>{max_phi_field_neg_pct}%")
+    except Exception as e:
+        phi_field_neg_pct = float("nan")
+        reasons.append(f"phi_field_read_fail:{type(e).__name__}")
+
+    try:
+        phi_body = pd.read_csv(p_body, usecols=["phi_nd"])["phi_nd"]
+        phi_body = pd.to_numeric(phi_body, errors="coerce")
+        phi_body_abs_mean = float(phi_body.abs().mean())
+        phi_body_abs_max = float(phi_body.abs().max())
+        if phi_body_abs_mean > tol_phi_body_abs_mean:
+            reasons.append(f"sanity_fail:phi_body_abs_mean={phi_body_abs_mean:.3e}>{tol_phi_body_abs_mean:.3e}")
+        if phi_body_abs_max > 5.0 * tol_phi_body_abs_mean:
+            reasons.append(f"sanity_fail:phi_body_abs_max={phi_body_abs_max:.3e}>{5.0 * tol_phi_body_abs_mean:.3e}")
+    except Exception as e:
+        phi_body_abs_mean = float("nan")
+        phi_body_abs_max = float("nan")
+        reasons.append(f"phi_body_read_fail:{type(e).__name__}")
+
+    data_used = _compose_data_used(
+        has_field_uvp=has_field_uvp,
+        rows_field_core=rows_field,
+        rows_bc_inlet=rows_inlet,
+        rows_bc_outlet=rows_outlet,
+        rows_bc_wall=rows_wall,
+        rows_bc_body=rows_body,
+        has_cd_target=has_cd_target,
+        has_cl_target=has_cl_target,
+        has_deltap_target=has_deltap_target,
+        has_La_target=has_La_target,
+    )
+
+    status = "PASS" if len(reasons) == 0 else "FAIL"
+
+    return CaseAudit(
+        nd_dir=str(nd_dir),
+        case_id=case_id,
+        shape=shape,
+        Re=Re,
+        status=status,
+        reasons=";".join(reasons) if reasons else "OK",
+        has_scales=has_scales,
+        has_reference_points=has_reference_points,
+        has_final_values_section=has_final_values_section,
+        has_notes=has_notes,
+        has_geometry_info=has_geometry_info,
+        has_legacy_files_or_keys=has_legacy_files_or_keys,
+        rows_field_core=rows_field,
+        rows_bc_inlet=rows_inlet,
+        rows_bc_outlet=rows_outlet,
+        rows_bc_wall=rows_wall,
+        rows_bc_body=rows_body,
+        has_field_u=has_field_u,
+        has_field_v=has_field_v,
+        has_field_p=has_field_p,
+        has_field_uvp=has_field_uvp,
+        has_cd_target=has_cd_target,
+        has_cl_target=has_cl_target,
+        has_deltap_target=has_deltap_target,
+        has_La_target=has_La_target,
+        phi_field_neg_pct=phi_field_neg_pct,
+        phi_body_abs_mean=phi_body_abs_mean,
+        phi_body_abs_max=phi_body_abs_max,
+        data_used=data_used,
+    )
+
+
+def audit_all(root: Path, report_csv: Path):
+    nd_dirs = discover_nd_dirs(root)
+
+    if len(nd_dirs) == 0:
+        empty = pd.DataFrame(columns=[f.name for f in CaseAudit.__dataclass_fields__.values()])
+        empty.to_csv(report_csv, index=False)
+        print("\n=== AUDIT SUMMARY ===")
+        print(f"root: {root}")
+        print("PASS: 0 | FAIL: 0")
+        print(f"report: {report_csv}")
+        print("\nNo nd/case_summary.json found. Nothing to train on (this is OK).")
+        return {"passed": [], "failed": [], "all": []}
+
+    audits: List[CaseAudit] = []
+    for nd_dir in nd_dirs:
+        audits.append(audit_one_case(nd_dir))
+
+    df = pd.DataFrame([asdict(a) for a in audits]).sort_values(["shape", "Re", "case_id"]).reset_index(drop=True)
+    df.to_csv(report_csv, index=False)
+
+    passed = [a for a in audits if a.status == "PASS"]
+    failed = [a for a in audits if a.status == "FAIL"]
+
+    print("\n=== AUDIT SUMMARY ===")
+    print(f"root: {root}")
+    print(f"PASS: {len(passed)} | FAIL: {len(failed)}")
+    print(f"report: {report_csv}\n")
+
+    print("=== CASES USED FOR TRAINING (PASS) ===")
+    if passed:
+        for a in sorted(passed, key=lambda z: (z.shape, z.Re, z.case_id)):
+            print(
+                f"- {a.shape} | Re={a.Re} | case_id={a.case_id} | "
+                f"field_core_rows={a.rows_field_core} | data={a.data_used}"
+            )
+    else:
+        print("None")
+
+    if failed:
+        print("\n=== SKIPPED CASES (FAIL) ===")
+        for a in sorted(failed, key=lambda z: (z.shape, z.Re, z.case_id)):
+            print(f"- {a.nd_dir} | reason: {a.reasons}")
+
+    return {"passed": passed, "failed": failed, "all": audits}
+
+
+# ============================================================
+# Run
+# ============================================================
+results = audit_all(ROOT, REPORT)
+
+if len(results["all"]) > 0:
+    audit_df = pd.DataFrame([asdict(a) for a in results["all"]]).sort_values(["shape", "Re", "case_id"]).reset_index(drop=True)
+else:
+    audit_df = pd.DataFrame(columns=[f.name for f in CaseAudit.__dataclass_fields__.values()])
+
+audit_df
